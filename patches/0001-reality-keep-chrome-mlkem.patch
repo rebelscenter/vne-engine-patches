@@ -1,0 +1,35 @@
+diff --git a/common/tls/reality_client.go b/common/tls/reality_client.go
+index af64ef6..1523122 100644
+--- a/common/tls/reality_client.go
++++ b/common/tls/reality_client.go
+@@ -145,16 +145,20 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	for _, extension := range uConn.Extensions {
+-		if ce, ok := extension.(*utls.SupportedCurvesExtension); ok {
+-			ce.Curves = common.Filter(ce.Curves, func(curveID utls.CurveID) bool {
+-				return curveID != utls.X25519MLKEM768
+-			})
+-		}
+-		if ks, ok := extension.(*utls.KeyShareExtension); ok {
+-			ks.KeyShares = common.Filter(ks.KeyShares, func(share utls.KeyShare) bool {
+-				return share.Group != utls.X25519MLKEM768
+-			})
++	// VNE: Xray >= 26.9.8 REALITY requires Chrome's X25519MLKEM768 key share
++	// first, so the Chrome parrot keeps it; other parrots are filtered as before.
++	if e.uClient.id.Client != "Chrome" {
++		for _, extension := range uConn.Extensions {
++			if ce, ok := extension.(*utls.SupportedCurvesExtension); ok {
++				ce.Curves = common.Filter(ce.Curves, func(curveID utls.CurveID) bool {
++					return curveID != utls.X25519MLKEM768
++				})
++			}
++			if ks, ok := extension.(*utls.KeyShareExtension); ok {
++				ks.KeyShares = common.Filter(ks.KeyShares, func(share utls.KeyShare) bool {
++					return share.Group != utls.X25519MLKEM768
++				})
++			}
+ 		}
+ 	}
+ 	err = uConn.BuildHandshakeState()

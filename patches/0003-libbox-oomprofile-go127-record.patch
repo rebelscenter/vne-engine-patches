@@ -1,0 +1,129 @@
+diff --git a/experimental/libbox/internal/oomprofile/memrecord_go127.go b/experimental/libbox/internal/oomprofile/memrecord_go127.go
+new file mode 100644
+index 0000000..97a00b5
+--- /dev/null
++++ b/experimental/libbox/internal/oomprofile/memrecord_go127.go
+@@ -0,0 +1,15 @@
++//go:build (darwin || linux || windows) && go1.27
++
++package oomprofile
++
++// Mirrors internal/profilerecord.MemProfileRecord, which Go 1.27 reshaped to
++// one ObjectSize; pprof_memProfileInternal fills this layout byte for byte.
++type memProfileRecord struct {
++	ObjectSize                int64
++	AllocObjects, FreeObjects int64
++	Stack                     []uintptr
++}
++
++func (r *memProfileRecord) AllocBytes() int64   { return r.AllocObjects * r.ObjectSize }
++func (r *memProfileRecord) InUseBytes() int64   { return r.InUseObjects() * r.ObjectSize }
++func (r *memProfileRecord) InUseObjects() int64 { return r.AllocObjects - r.FreeObjects }
+diff --git a/experimental/libbox/internal/oomprofile/memrecord_pre_go127.go b/experimental/libbox/internal/oomprofile/memrecord_pre_go127.go
+new file mode 100644
+index 0000000..497b64e
+--- /dev/null
++++ b/experimental/libbox/internal/oomprofile/memrecord_pre_go127.go
+@@ -0,0 +1,13 @@
++//go:build (darwin || linux || windows) && !go1.27
++
++package oomprofile
++
++type memProfileRecord struct {
++	allocBytes, FreeBytes     int64
++	AllocObjects, FreeObjects int64
++	Stack                     []uintptr
++}
++
++func (r *memProfileRecord) AllocBytes() int64   { return r.allocBytes }
++func (r *memProfileRecord) InUseBytes() int64   { return r.allocBytes - r.FreeBytes }
++func (r *memProfileRecord) InUseObjects() int64 { return r.AllocObjects - r.FreeObjects }
+diff --git a/experimental/libbox/internal/oomprofile/oomprofile.go b/experimental/libbox/internal/oomprofile/oomprofile.go
+index 0728af8..5ef9bc1 100644
+--- a/experimental/libbox/internal/oomprofile/oomprofile.go
++++ b/experimental/libbox/internal/oomprofile/oomprofile.go
+@@ -19,20 +19,6 @@ type stackRecord struct {
+ 	Stack []uintptr
+ }
+ 
+-type memProfileRecord struct {
+-	AllocBytes, FreeBytes     int64
+-	AllocObjects, FreeObjects int64
+-	Stack                     []uintptr
+-}
+-
+-func (r *memProfileRecord) InUseBytes() int64 {
+-	return r.AllocBytes - r.FreeBytes
+-}
+-
+-func (r *memProfileRecord) InUseObjects() int64 {
+-	return r.AllocObjects - r.FreeObjects
+-}
+-
+ type blockProfileRecord struct {
+ 	Count  int64
+ 	Cycles int64
+@@ -338,12 +324,12 @@ func writeHeapProto(w io.Writer, profile []memProfileRecord, rate int64, default
+ 			hideRuntime = false
+ 		}
+ 
+-		values[0], values[1] = scaleHeapSample(record.AllocObjects, record.AllocBytes, rate)
++		values[0], values[1] = scaleHeapSample(record.AllocObjects, record.AllocBytes(), rate)
+ 		values[2], values[3] = scaleHeapSample(record.InUseObjects(), record.InUseBytes(), rate)
+ 
+ 		var blockSize int64
+ 		if record.AllocObjects > 0 {
+-			blockSize = record.AllocBytes / record.AllocObjects
++			blockSize = record.AllocBytes() / record.AllocObjects
+ 		}
+ 		builder.pbSample(values, locs, func() {
+ 			if blockSize != 0 {
+diff --git a/experimental/libbox/internal/oomprofile/oomprofile_test.go b/experimental/libbox/internal/oomprofile/oomprofile_test.go
+new file mode 100644
+index 0000000..0c058c4
+--- /dev/null
++++ b/experimental/libbox/internal/oomprofile/oomprofile_test.go
+@@ -0,0 +1,43 @@
++//go:build darwin || linux || windows
++
++package oomprofile
++
++import (
++	"bytes"
++	"runtime"
++	"testing"
++)
++
++var sink [][]byte
++
++// The memory-pressure callback writes this profile; a record layout that does
++// not match the runtime's reads garbage stacks and crashes the extension.
++func TestWriteAllocMatchesRuntimeRecords(t *testing.T) {
++	old := runtime.MemProfileRate
++	runtime.MemProfileRate = 1
++	t.Cleanup(func() { runtime.MemProfileRate = old })
++	for i := 0; i < 1000; i++ {
++		sink = append(sink, make([]byte, 4096))
++	}
++	runtime.GC()
++
++	n, _ := runtimeMemProfileInternal(nil, true)
++	records := make([]memProfileRecord, n+50)
++	n, ok := runtimeMemProfileInternal(records, true)
++	if !ok || n == 0 {
++		t.Fatalf("runtime returned %d records, ok=%v", n, ok)
++	}
++	for _, record := range records[:n] {
++		if record.InUseObjects() < 0 || len(record.Stack) == 0 || len(record.Stack) > 1024 {
++			t.Fatalf("record read with the wrong layout: objects %d, stack of %d", record.InUseObjects(), len(record.Stack))
++		}
++	}
++
++	var out bytes.Buffer
++	if err := writeAlloc(&out); err != nil {
++		t.Fatal(err)
++	}
++	if out.Len() == 0 {
++		t.Fatal("empty allocs profile")
++	}
++}

@@ -1,0 +1,795 @@
+diff --git a/constant/v2ray.go b/constant/v2ray.go
+index c3089a6..1811df5 100644
+--- a/constant/v2ray.go
++++ b/constant/v2ray.go
+@@ -6,4 +6,5 @@ const (
+ 	V2RayTransportTypeQUIC        = "quic"
+ 	V2RayTransportTypeGRPC        = "grpc"
+ 	V2RayTransportTypeHTTPUpgrade = "httpupgrade"
++	V2RayTransportTypeXHTTP       = "xhttp"
+ )
+diff --git a/option/v2ray_transport.go b/option/v2ray_transport.go
+index 8788151..ffbd653 100644
+--- a/option/v2ray_transport.go
++++ b/option/v2ray_transport.go
+@@ -12,12 +12,13 @@ import (
+ )
+ 
+ type _V2RayTransportOptions struct {
+-	Type               string                  `json:"type" enum:"http,ws,quic,grpc,httpupgrade"`
++	Type               string                  `json:"type" enum:"http,ws,quic,grpc,httpupgrade,xhttp"`
+ 	HTTPOptions        V2RayHTTPOptions        `json:"-"`
+ 	WebsocketOptions   V2RayWebsocketOptions   `json:"-"`
+ 	QUICOptions        V2RayQUICOptions        `json:"-"`
+ 	GRPCOptions        V2RayGRPCOptions        `json:"-"`
+ 	HTTPUpgradeOptions V2RayHTTPUpgradeOptions `json:"-"`
++	XHTTPOptions       V2RayXHTTPOptions       `json:"-"`
+ }
+ 
+ type V2RayTransportOptions _V2RayTransportOptions
+@@ -35,6 +36,8 @@ func (o V2RayTransportOptions) MarshalJSON() ([]byte, error) {
+ 		v = o.GRPCOptions
+ 	case C.V2RayTransportTypeHTTPUpgrade:
+ 		v = o.HTTPUpgradeOptions
++	case C.V2RayTransportTypeXHTTP:
++		v = o.XHTTPOptions
+ 	case "":
+ 		return nil, E.New("missing transport type")
+ 	default:
+@@ -60,6 +63,8 @@ func (o *V2RayTransportOptions) UnmarshalJSON(bytes []byte) error {
+ 		v = &o.GRPCOptions
+ 	case C.V2RayTransportTypeHTTPUpgrade:
+ 		v = &o.HTTPUpgradeOptions
++	case C.V2RayTransportTypeXHTTP:
++		v = &o.XHTTPOptions
+ 	default:
+ 		return E.New("unknown transport type: " + o.Type)
+ 	}
+@@ -78,6 +83,7 @@ func (o V2RayTransportOptions) DescribeSchema(builder schema.Builder) (*schema.N
+ 			{Value: C.V2RayTransportTypeQUIC, StructType: reflect.TypeFor[V2RayQUICOptions]()},
+ 			{Value: C.V2RayTransportTypeGRPC, StructType: reflect.TypeFor[V2RayGRPCOptions]()},
+ 			{Value: C.V2RayTransportTypeHTTPUpgrade, StructType: reflect.TypeFor[V2RayHTTPUpgradeOptions]()},
++			{Value: C.V2RayTransportTypeXHTTP, StructType: reflect.TypeFor[V2RayXHTTPOptions]()},
+ 		}, nil)
+ 	})
+ }
+@@ -113,3 +119,13 @@ type V2RayHTTPUpgradeOptions struct {
+ 	Path    string               `json:"path,omitempty"`
+ 	Headers badoption.HTTPHeader `json:"headers,omitempty"`
+ }
++
++// XHTTP (Xray-core "splithttp") client transport; see transport/v2rayxhttp.
++type V2RayXHTTPOptions struct {
++	Host        string               `json:"host,omitempty"`
++	Path        string               `json:"path,omitempty"`
++	Mode        string               `json:"mode,omitempty" enum:"auto,stream-one,stream-up"`
++	Headers     badoption.HTTPHeader `json:"headers,omitempty"`
++	IdleTimeout badoption.Duration   `json:"idle_timeout,omitempty"`
++	PingTimeout badoption.Duration   `json:"ping_timeout,omitempty"`
++}
+diff --git a/transport/v2ray/transport.go b/transport/v2ray/transport.go
+index ab52f55..bf45873 100644
+--- a/transport/v2ray/transport.go
++++ b/transport/v2ray/transport.go
+@@ -10,6 +10,7 @@ import (
+ 	"github.com/sagernet/sing-box/transport/v2rayhttp"
+ 	"github.com/sagernet/sing-box/transport/v2rayhttpupgrade"
+ 	"github.com/sagernet/sing-box/transport/v2raywebsocket"
++	"github.com/sagernet/sing-box/transport/v2rayxhttp"
+ 	E "github.com/sagernet/sing/common/exceptions"
+ 	"github.com/sagernet/sing/common/logger"
+ 	M "github.com/sagernet/sing/common/metadata"
+@@ -39,6 +40,8 @@ func NewServerTransport(ctx context.Context, logger logger.ContextLogger, option
+ 		return NewGRPCServer(ctx, logger, options.GRPCOptions, tlsConfig, handler)
+ 	case C.V2RayTransportTypeHTTPUpgrade:
+ 		return v2rayhttpupgrade.NewServer(ctx, logger, options.HTTPUpgradeOptions, tlsConfig, handler)
++	case C.V2RayTransportTypeXHTTP:
++		return nil, E.New("xhttp server transport is not implemented")
+ 	default:
+ 		return nil, E.New("unknown transport type: " + options.Type)
+ 	}
+@@ -62,6 +65,8 @@ func NewClientTransport(ctx context.Context, dialer N.Dialer, serverAddr M.Socks
+ 		return NewQUICClient(ctx, dialer, serverAddr, options.QUICOptions, tlsConfig)
+ 	case C.V2RayTransportTypeHTTPUpgrade:
+ 		return v2rayhttpupgrade.NewClient(ctx, dialer, serverAddr, options.HTTPUpgradeOptions, tlsConfig)
++	case C.V2RayTransportTypeXHTTP:
++		return v2rayxhttp.NewClient(ctx, dialer, serverAddr, options.XHTTPOptions, tlsConfig)
+ 	default:
+ 		return nil, E.New("unknown transport type: " + options.Type)
+ 	}
+diff --git a/transport/v2rayxhttp/client.go b/transport/v2rayxhttp/client.go
+new file mode 100644
+index 0000000..3cfc236
+--- /dev/null
++++ b/transport/v2rayxhttp/client.go
+@@ -0,0 +1,260 @@
++// Package v2rayxhttp is a client for Xray-core's XHTTP ("splithttp") transport
++// in its stream-one and stream-up modes over HTTP/2. The wire format follows
++// github.com/xtls/xray-core/transport/internet/splithttp (MPL-2.0, XTLS
++// contributors); this is an independent client-side port for sing-box.
++package v2rayxhttp
++
++import (
++	"context"
++	"io"
++	"math/rand/v2"
++	"net"
++	"net/http"
++	"net/url"
++	"strings"
++	"sync"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/tls"
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing-box/transport/v2rayhttp"
++	E "github.com/sagernet/sing/common/exceptions"
++	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
++
++	"github.com/gofrs/uuid/v5"
++	"golang.org/x/net/http2"
++)
++
++var _ adapter.V2RayClientTransport = (*Client)(nil)
++
++const (
++	ModeAuto      = "auto"
++	ModeStreamOne = "stream-one"
++	ModeStreamUp  = "stream-up"
++
++	// Xray keeps an h2 connection alive like Chrome does; a dead mobile link is
++	// noticed after one missed PING instead of a TCP timeout.
++	defaultReadIdleTimeout = 45 * time.Second
++	defaultIdleConnTimeout = 300 * time.Second
++	// The server (non-obfs mode) requires 100..1000 X's in Referer's x_padding.
++	paddingMin = 100
++	paddingMax = 1000
++	// Xray's xmux default (hMaxReusableSecs 1800-3000): no h2 connection is reused past this.
++	connLifetimeMin = 30 * time.Minute
++	connLifetimeMax = 50 * time.Minute
++)
++
++// Xray's "chrome"/"fetch" masquerade; a user-supplied header wins.
++var defaultHeaders = http.Header{
++	"User-Agent":      {"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"},
++	"Accept":          {"*/*"},
++	"Accept-Language": {"en-US,en;q=0.9"},
++	"Cache-Control":   {"no-cache"},
++	"Pragma":          {"no-cache"},
++	"Priority":        {"u=1, i"},
++	"Sec-Fetch-Dest":  {"empty"},
++	"Sec-Fetch-Mode":  {"cors"},
++	"Sec-Fetch-Site":  {"same-origin"},
++	"DNT":             {"1"},
++}
++
++type Client struct {
++	ctx          context.Context
++	newTransport func() *http2.Transport
++	access       sync.Mutex
++	transport    *http2.Transport
++	// Every earlier generation, kept for Close: one per 30-50 min, idle ones hold no connections.
++	retired []*http2.Transport
++	renewAt time.Time
++	baseURL url.URL
++	host    string
++	mode    string
++	headers http.Header
++}
++
++func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, options option.V2RayXHTTPOptions, tlsConfig tls.Config) (*Client, error) {
++	if tlsConfig == nil {
++		return nil, E.Cause(C.ErrTLSRequired, "xhttp runs over HTTP/2")
++	}
++	mode := options.Mode
++	switch mode {
++	case "", ModeAuto:
++		mode = ModeStreamOne
++	case ModeStreamOne, ModeStreamUp:
++	default:
++		return nil, E.New("unsupported xhttp mode: ", mode, " (packet-up and xmux are not implemented)")
++	}
++	if len(tlsConfig.NextProtos()) == 0 {
++		tlsConfig.SetNextProtos([]string{http2.NextProtoTLS})
++	}
++	host := options.Host
++	if host == "" {
++		host = tlsConfig.ServerName()
++	}
++	if host == "" {
++		host = serverAddr.AddrString()
++	}
++	path, query, _ := strings.Cut(options.Path, "?")
++	if !strings.HasPrefix(path, "/") {
++		path = "/" + path
++	}
++	// Session id and seq live in the path, so the server matches "<path>/" + id.
++	if !strings.HasSuffix(path, "/") {
++		path += "/"
++	}
++	headers := defaultHeaders.Clone()
++	for key, values := range options.Headers.Build() {
++		headers[http.CanonicalHeaderKey(key)] = values
++	}
++	readIdleTimeout := time.Duration(options.IdleTimeout)
++	if readIdleTimeout == 0 {
++		readIdleTimeout = defaultReadIdleTimeout
++	}
++	tlsDialer := tls.NewDialer(dialer, tlsConfig)
++	client := &Client{
++		ctx: ctx,
++		newTransport: func() *http2.Transport {
++			return &http2.Transport{
++				DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.STDConfig) (net.Conn, error) {
++					return tlsDialer.DialTLSContext(ctx, M.ParseSocksaddr(addr))
++				},
++				ReadIdleTimeout:    readIdleTimeout,
++				PingTimeout:        time.Duration(options.PingTimeout),
++				IdleConnTimeout:    defaultIdleConnTimeout,
++				DisableCompression: true,
++			}
++		},
++		baseURL: url.URL{
++			Scheme:   "https",
++			Host:     serverAddr.String(),
++			Path:     path,
++			RawQuery: query,
++		},
++		host:    host,
++		mode:    mode,
++		headers: headers,
++	}
++	return client, nil
++}
++
++// roundTripper starts a fresh transport (new connections) once the current one outlives
++// its lifetime; streams already on the old one finish there and its idle connections close.
++func (c *Client) roundTripper() *http2.Transport {
++	c.access.Lock()
++	defer c.access.Unlock()
++	now := time.Now()
++	if c.transport == nil || !now.Before(c.renewAt) {
++		if c.transport != nil {
++			c.transport.CloseIdleConnections()
++			c.retired = append(c.retired, c.transport)
++		}
++		c.transport = c.newTransport()
++		c.renewAt = now.Add(connLifetimeMin + rand.N(connLifetimeMax-connLifetimeMin+1))
++	}
++	return c.transport
++}
++
++func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
++	switch c.mode {
++	case ModeStreamUp:
++		return c.dialStreamUp(ctx)
++	default:
++		return c.dialStreamOne(ctx)
++	}
++}
++
++// stream-one: one POST whose request body is the uplink and response body the downlink.
++func (c *Client) dialStreamOne(ctx context.Context) (net.Conn, error) {
++	pipeReader, pipeWriter := io.Pipe()
++	conn := newStreamConn(pipeWriter)
++	request := c.newRequest(ctx, http.MethodPost, "", pipeReader)
++	go c.openDownlink(c.roundTripper(), request, conn)
++	return conn, nil
++}
++
++// stream-up: GET <path>/<session> for the downlink, POST <path>/<session> streaming the uplink.
++func (c *Client) dialStreamUp(ctx context.Context) (net.Conn, error) {
++	sessionID, err := uuid.NewV4()
++	if err != nil {
++		return nil, err
++	}
++	pipeReader, pipeWriter := io.Pipe()
++	conn := newStreamConn(pipeWriter)
++	download := c.newRequest(ctx, http.MethodGet, sessionID.String(), nil)
++	upload := c.newRequest(ctx, http.MethodPost, sessionID.String(), pipeReader)
++	transport := c.roundTripper()
++	go c.openDownlink(transport, download, conn)
++	go func() {
++		response, err := transport.RoundTrip(upload)
++		if err != nil {
++			conn.closeWithError(E.Cause(err, "xhttp: upload"))
++			return
++		}
++		// Xray pads this response for as long as the stream lives; closing it early would reset the uplink.
++		_, _ = io.Copy(io.Discard, response.Body)
++		response.Body.Close()
++		if response.StatusCode != http.StatusOK {
++			conn.closeWithError(E.New("xhttp: upload status ", response.Status))
++		}
++	}()
++	return conn, nil
++}
++
++func (c *Client) openDownlink(transport *http2.Transport, request *http.Request, conn *streamConn) {
++	response, err := transport.RoundTrip(request)
++	if err != nil {
++		conn.setup(nil, err)
++	} else if response.StatusCode != http.StatusOK {
++		response.Body.Close()
++		conn.setup(nil, E.New("xhttp: unexpected status ", response.Status))
++	} else {
++		conn.setup(response.Body, nil)
++	}
++}
++
++func (c *Client) newRequest(ctx context.Context, method string, sessionID string, body io.Reader) *http.Request {
++	requestURL := c.baseURL
++	requestURL.Path += sessionID
++	header := c.headers.Clone()
++	// Like a browser's: the site's name, not the address dialed.
++	referer := requestURL
++	referer.Host = c.host
++	referer.RawQuery = "x_padding=" + strings.Repeat("X", paddingMin+rand.IntN(paddingMax-paddingMin+1))
++	header.Set("Referer", referer.String())
++	if body != nil {
++		header.Set("Content-Type", "application/grpc")
++	}
++	request := &http.Request{
++		Method: method,
++		URL:    &requestURL,
++		Header: header,
++		Body:   nopCloser(body),
++		Host:   c.host,
++	}
++	return request.WithContext(ctx)
++}
++
++func nopCloser(reader io.Reader) io.ReadCloser {
++	if reader == nil {
++		return nil
++	}
++	if closer, isCloser := reader.(io.ReadCloser); isCloser {
++		return closer
++	}
++	return io.NopCloser(reader)
++}
++
++func (c *Client) Close() error {
++	c.access.Lock()
++	defer c.access.Unlock()
++	for _, transport := range append(c.retired, c.transport) {
++		if transport != nil {
++			v2rayhttp.ResetTransport(transport)
++		}
++	}
++	c.retired = nil
++	return nil
++}
+diff --git a/transport/v2rayxhttp/client_test.go b/transport/v2rayxhttp/client_test.go
+new file mode 100644
+index 0000000..bda35ff
+--- /dev/null
++++ b/transport/v2rayxhttp/client_test.go
+@@ -0,0 +1,327 @@
++package v2rayxhttp
++
++import (
++	"context"
++	"io"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/common/tls"
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
++	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
++
++	"golang.org/x/net/http2"
++)
++
++func newTestClient(t *testing.T, options option.V2RayXHTTPOptions) *Client {
++	t.Helper()
++	tlsConfig, err := tls.NewClient(context.Background(), log.NewNOPFactory().NewLogger("test"), "example.com", option.OutboundTLSOptions{Enabled: true, ServerName: "example.com"})
++	if err != nil {
++		t.Fatal(err)
++	}
++	client, err := NewClient(context.Background(), N.SystemDialer, M.ParseSocksaddrHostPort("198.51.100.1", 443), options, tlsConfig)
++	if err != nil {
++		t.Fatal(err)
++	}
++	return client
++}
++
++// Xray's hub matches "<path>/" and reads x_padding (100..1000 X's) from Referer.
++func TestNewRequestMatchesXraySplitHTTP(t *testing.T) {
++	client := newTestClient(t, option.V2RayXHTTPOptions{Path: "/vne-test-path"})
++	request := client.newRequest(context.Background(), http.MethodPost, "", strings.NewReader(""))
++	if got := request.URL.Path; got != "/vne-test-path/" {
++		t.Fatalf("path = %q, want trailing slash", got)
++	}
++	if got := request.Host; got != "example.com" {
++		t.Fatalf("host = %q, want TLS server name", got)
++	}
++	if got := request.Header.Get("Content-Type"); got != "application/grpc" {
++		t.Fatalf("content-type = %q", got)
++	}
++	referer := request.Header.Get("Referer")
++	// A browser's Referer names the site, not the IP it dialed.
++	prefix := "https://example.com/vne-test-path/?x_padding="
++	if !strings.HasPrefix(referer, prefix) {
++		t.Fatalf("referer = %q", referer)
++	}
++	padding := strings.TrimPrefix(referer, prefix)
++	if n := len(padding); n < paddingMin || n > paddingMax || strings.Trim(padding, "X") != "" {
++		t.Fatalf("padding %d bytes %q", n, padding[:min(n, 8)])
++	}
++	download := client.newRequest(context.Background(), http.MethodGet, "session", nil)
++	if download.URL.Path != "/vne-test-path/session" || download.Header.Get("Content-Type") != "" || download.Body != nil {
++		t.Fatalf("stream-up GET: path %q content-type %q", download.URL.Path, download.Header.Get("Content-Type"))
++	}
++}
++
++func TestModeAndTLSValidation(t *testing.T) {
++	for _, mode := range []string{"", "auto", "stream-one"} {
++		if got := newTestClient(t, option.V2RayXHTTPOptions{Mode: mode}).mode; got != ModeStreamOne {
++			t.Fatalf("mode %q resolved to %q", mode, got)
++		}
++	}
++	tlsConfig, _ := tls.NewClient(context.Background(), log.NewNOPFactory().NewLogger("test"), "example.com", option.OutboundTLSOptions{Enabled: true})
++	if _, err := NewClient(context.Background(), N.SystemDialer, M.ParseSocksaddrHostPort("198.51.100.1", 443), option.V2RayXHTTPOptions{Mode: "packet-up"}, tlsConfig); err == nil || !strings.Contains(err.Error(), "packet-up") {
++		t.Fatalf("packet-up accepted: %v", err)
++	}
++	if _, err := NewClient(context.Background(), N.SystemDialer, M.ParseSocksaddrHostPort("198.51.100.1", 443), option.V2RayXHTTPOptions{}, nil); err == nil {
++		t.Fatal("plain TCP accepted; xhttp needs TLS for HTTP/2")
++	}
++}
++
++// newLoopbackClient dials an in-process HTTP/2 server standing in for Xray's hub;
++// quit is closed before the server shuts down so handlers that hold a stream return.
++func newLoopbackClient(t *testing.T, mode string, quit chan struct{}, handler http.Handler) *Client {
++	t.Helper()
++	server := httptest.NewUnstartedServer(handler)
++	server.EnableHTTP2 = true
++	server.StartTLS()
++	t.Cleanup(server.Close)
++	t.Cleanup(func() { close(quit) })
++	tlsConfig, err := tls.NewClient(context.Background(), log.NewNOPFactory().NewLogger("test"), "example.com", option.OutboundTLSOptions{Enabled: true, ServerName: "example.com", Insecure: true})
++	if err != nil {
++		t.Fatal(err)
++	}
++	client, err := NewClient(context.Background(), N.SystemDialer, M.ParseSocksaddr(server.Listener.Addr().String()), option.V2RayXHTTPOptions{Path: "/xh", Mode: mode}, tlsConfig)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { client.Close() })
++	return client
++}
++
++func flushWriter(w http.ResponseWriter) io.Writer {
++	return writerFunc(func(b []byte) (int, error) {
++		n, err := w.Write(b)
++		w.(http.Flusher).Flush()
++		return n, err
++	})
++}
++
++type writerFunc func([]byte) (int, error)
++
++func (f writerFunc) Write(b []byte) (int, error) { return f(b) }
++
++func echoOnce(t *testing.T, conn net.Conn) {
++	t.Helper()
++	if _, err := conn.Write([]byte("ping")); err != nil {
++		t.Fatal(err)
++	}
++	reply := make([]byte, 4)
++	if _, err := io.ReadFull(conn, reply); err != nil || string(reply) != "ping" {
++		t.Fatalf("echo = %q, %v", reply, err)
++	}
++}
++
++func TestStreamOneExchangesData(t *testing.T) {
++	client := newLoopbackClient(t, ModeStreamOne, make(chan struct{}), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.WriteHeader(http.StatusOK)
++		_, _ = io.Copy(flushWriter(w), r.Body)
++	}))
++	conn, err := client.DialContext(context.Background())
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer conn.Close()
++	echoOnce(t, conn)
++}
++
++// stream-up: the POST body comes back on the GET of the same session.
++func TestStreamUpExchangesData(t *testing.T) {
++	var sessions sync.Map
++	pipe := func(id string) *io.PipeReader {
++		reader, writer := io.Pipe()
++		actual, _ := sessions.LoadOrStore(id, [2]any{reader, writer})
++		return actual.([2]any)[0].(*io.PipeReader)
++	}
++	client := newLoopbackClient(t, ModeStreamUp, make(chan struct{}), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		id := strings.TrimPrefix(r.URL.Path, "/xh/")
++		pipe(id)
++		pair, _ := sessions.Load(id)
++		if r.Method == http.MethodPost {
++			_, _ = io.Copy(pair.([2]any)[1].(*io.PipeWriter), r.Body)
++			return
++		}
++		w.WriteHeader(http.StatusOK)
++		_, _ = io.Copy(flushWriter(w), pair.([2]any)[0].(*io.PipeReader))
++	}))
++	conn, err := client.DialContext(context.Background())
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer conn.Close()
++	echoOnce(t, conn)
++}
++
++// A failed upload must end the connection even though the downlink GET is still open.
++func TestStreamUpUploadFailureEndsRead(t *testing.T) {
++	downlinkOpen := make(chan struct{})
++	failUpload := make(chan struct{})
++	quit := make(chan struct{})
++	client := newLoopbackClient(t, ModeStreamUp, quit, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if r.Method == http.MethodGet {
++			w.WriteHeader(http.StatusOK)
++			w.(http.Flusher).Flush()
++			select {
++			case <-r.Context().Done():
++			case <-quit:
++			}
++			return
++		}
++		select {
++		case <-failUpload:
++		case <-quit:
++			return
++		}
++		w.WriteHeader(http.StatusInternalServerError)
++	}))
++	conn, err := client.DialContext(context.Background())
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer conn.Close()
++	go func() {
++		<-conn.(*streamConn).ready
++		close(downlinkOpen)
++	}()
++	select {
++	case <-downlinkOpen:
++	case <-time.After(5 * time.Second):
++		t.Fatal("downlink never opened")
++	}
++	close(failUpload)
++	readDone := make(chan error, 1)
++	go func() {
++		_, err := conn.Read(make([]byte, 1))
++		readDone <- err
++	}()
++	select {
++	case err := <-readDone:
++		if err == nil {
++			t.Fatal("read succeeded after a failed upload")
++		}
++	case <-time.After(5 * time.Second):
++		t.Fatal("read still blocked 5s after the upload failed")
++	}
++}
++
++// Xray pads the stream-up upload response for as long as the stream lives (100-1000
++// bytes every 20-80 s); a client that stops reading it resets the uplink.
++func TestStreamUpSurvivesPaddedUploadResponse(t *testing.T) {
++	var sessions sync.Map
++	pipe := func(id string) [2]any {
++		reader, writer := io.Pipe()
++		actual, _ := sessions.LoadOrStore(id, [2]any{reader, writer})
++		return actual.([2]any)
++	}
++	padded := make(chan struct{})
++	quit := make(chan struct{})
++	client := newLoopbackClient(t, ModeStreamUp, quit, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		pair := pipe(strings.TrimPrefix(r.URL.Path, "/xh/"))
++		w.WriteHeader(http.StatusOK)
++		if r.Method == http.MethodGet {
++			go func() {
++				select {
++				case <-r.Context().Done():
++				case <-quit:
++				}
++				pair[0].(*io.PipeReader).Close()
++			}()
++			_, _ = io.Copy(flushWriter(w), pair[0].(*io.PipeReader))
++			return
++		}
++		go func() { _, _ = io.Copy(pair[1].(*io.PipeWriter), r.Body) }()
++		padding := []byte(strings.Repeat("X", 8<<10))
++		for range 16 { // 128 KiB, past any 64 KiB cut-off
++			if _, err := flushWriter(w).Write(padding); err != nil {
++				break
++			}
++		}
++		close(padded)
++		select {
++		case <-r.Context().Done():
++		case <-quit:
++		}
++	}))
++	conn, err := client.DialContext(context.Background())
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer conn.Close()
++	select {
++	case <-padded:
++	case <-time.After(5 * time.Second):
++		t.Fatal("server could not send the padding")
++	}
++	for range 10 {
++		echoWithin(t, conn, 5*time.Second)
++		time.Sleep(50 * time.Millisecond)
++	}
++}
++
++func echoWithin(t *testing.T, conn net.Conn, timeout time.Duration) {
++	t.Helper()
++	done := make(chan error, 1)
++	go func() {
++		if _, err := conn.Write([]byte("ping")); err != nil {
++			done <- err
++			return
++		}
++		reply := make([]byte, 4)
++		_, err := io.ReadFull(conn, reply)
++		if err == nil && string(reply) != "ping" {
++			err = io.ErrUnexpectedEOF
++		}
++		done <- err
++	}()
++	select {
++	case err := <-done:
++		if err != nil {
++			t.Fatalf("echo after the padding: %v", err)
++		}
++	case <-time.After(timeout):
++		t.Fatal("echo after the padding timed out: the uplink is gone")
++	}
++}
++
++// Connections are not reused past their lifetime: the next dial gets a fresh transport.
++func TestTransportIsRenewedAfterLifetime(t *testing.T) {
++	client := newTestClient(t, option.V2RayXHTTPOptions{})
++	first := client.roundTripper()
++	if client.roundTripper() != first {
++		t.Fatal("transport renewed before its lifetime")
++	}
++	if left := time.Until(client.renewAt); left < connLifetimeMin-time.Minute || left > connLifetimeMax {
++		t.Fatalf("lifetime %v outside [%v, %v]", left, connLifetimeMin, connLifetimeMax)
++	}
++	client.renewAt = time.Now().Add(-time.Second)
++	if client.roundTripper() == first {
++		t.Fatal("transport reused past its lifetime")
++	}
++}
++
++// Every generation a stream may still live on stays reachable, so Close resets
++// streams that outlived several rotations, not only the last one.
++func TestCloseReachesEveryRotatedTransport(t *testing.T) {
++	client := newTestClient(t, option.V2RayXHTTPOptions{})
++	var generations []*http2.Transport
++	for range 3 {
++		client.renewAt = time.Now().Add(-time.Second)
++		generations = append(generations, client.roundTripper())
++	}
++	if len(client.retired) != 2 || client.retired[0] != generations[0] || client.retired[1] != generations[1] {
++		t.Fatalf("retired %p, want the first two of %p", client.retired, generations)
++	}
++	client.Close()
++	if client.retired != nil {
++		t.Fatalf("retired %p after Close", client.retired)
++	}
++}
+diff --git a/transport/v2rayxhttp/conn.go b/transport/v2rayxhttp/conn.go
+new file mode 100644
+index 0000000..2267d18
+--- /dev/null
++++ b/transport/v2rayxhttp/conn.go
+@@ -0,0 +1,91 @@
++package v2rayxhttp
++
++import (
++	"io"
++	"net"
++	"os"
++	"sync"
++	"time"
++
++	"github.com/sagernet/sing/common"
++	"github.com/sagernet/sing/common/baderror"
++	M "github.com/sagernet/sing/common/metadata"
++)
++
++var _ net.Conn = (*streamConn)(nil)
++
++// streamConn joins the uplink pipe with a downlink body that arrives later.
++type streamConn struct {
++	writer    *io.PipeWriter
++	reader    io.ReadCloser
++	ready     chan struct{}
++	readyOnce sync.Once
++	err       error
++}
++
++func newStreamConn(writer *io.PipeWriter) *streamConn {
++	return &streamConn{writer: writer, ready: make(chan struct{})}
++}
++
++func (c *streamConn) setup(reader io.ReadCloser, err error) {
++	c.readyOnce.Do(func() {
++		c.reader = reader
++		c.err = err
++		close(c.ready)
++	})
++	if reader != nil && c.reader != reader {
++		reader.Close()
++	}
++}
++
++// closeWithError also ends a downlink that is already open, so Read does not wait for the server.
++func (c *streamConn) closeWithError(err error) {
++	c.setup(nil, err)
++	c.writer.CloseWithError(err)
++	if c.reader != nil {
++		c.reader.Close()
++	}
++}
++
++func (c *streamConn) Read(b []byte) (int, error) {
++	<-c.ready
++	if c.reader == nil {
++		return 0, c.err
++	}
++	n, err := c.reader.Read(b)
++	return n, baderror.WrapH2(err)
++}
++
++func (c *streamConn) Write(b []byte) (int, error) {
++	n, err := c.writer.Write(b)
++	return n, baderror.WrapH2(err)
++}
++
++func (c *streamConn) Close() error {
++	c.setup(nil, net.ErrClosed)
++	return common.Close(c.writer, c.reader)
++}
++
++func (c *streamConn) LocalAddr() net.Addr {
++	return M.Socksaddr{}
++}
++
++func (c *streamConn) RemoteAddr() net.Addr {
++	return M.Socksaddr{}
++}
++
++func (c *streamConn) SetDeadline(t time.Time) error {
++	return os.ErrInvalid
++}
++
++func (c *streamConn) SetReadDeadline(t time.Time) error {
++	return os.ErrInvalid
++}
++
++func (c *streamConn) SetWriteDeadline(t time.Time) error {
++	return os.ErrInvalid
++}
++
++func (c *streamConn) NeedAdditionalReadDeadline() bool {
++	return true
++}

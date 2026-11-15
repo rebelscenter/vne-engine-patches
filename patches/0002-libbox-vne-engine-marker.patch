@@ -1,0 +1,41 @@
+diff --git a/cmd/internal/build_libbox/main.go b/cmd/internal/build_libbox/main.go
+index 5b2d9e2..f6ea0a1 100644
+--- a/cmd/internal/build_libbox/main.go
++++ b/cmd/internal/build_libbox/main.go
+@@ -60,8 +60,18 @@ func init() {
+ 	if err != nil {
+ 		currentTag = "unknown"
+ 	}
+-	sharedFlags = append(sharedFlags, "-ldflags", build_shared.LinkerFlags(currentTag, false))
+-	debugFlags = append(debugFlags, "-ldflags", build_shared.LinkerFlags(currentTag, true))
++	linkerFlags, debugLinkerFlags := build_shared.LinkerFlags(currentTag, false), build_shared.LinkerFlags(currentTag, true)
++	// VNE: the engine marker the release gate reads back from the linked app binary.
++	if marker := os.Getenv("VNE_LIBBOX_MARKER"); marker != "" {
++		if strings.ContainsAny(marker, " \t'\"") {
++			log.Fatal("VNE_LIBBOX_MARKER must not contain spaces or quotes")
++		}
++		markerFlag := " -X github.com/sagernet/sing-box/experimental/libbox.vneEngineMarker=" + marker
++		linkerFlags += markerFlag
++		debugLinkerFlags += markerFlag
++	}
++	sharedFlags = append(sharedFlags, "-ldflags", linkerFlags)
++	debugFlags = append(debugFlags, "-ldflags", debugLinkerFlags)
+ 
+ 	sharedTags = append(sharedTags, "with_gvisor", "with_quic", "with_wireguard", "with_utls", "with_naive_outbound", "with_clash_api", "with_usbip", "with_openvpn", "with_openconnect", "badlinkname", "tfogo_checklinkname0")
+ 	darwinTags = append(darwinTags, "with_dhcp", "grpcnotrace")
+diff --git a/experimental/libbox/vne_engine_marker.go b/experimental/libbox/vne_engine_marker.go
+new file mode 100644
+index 0000000..9ab9eb0
+--- /dev/null
++++ b/experimental/libbox/vne_engine_marker.go
+@@ -0,0 +1,10 @@
++package libbox
++
++// vneEngineMarker is set at link time by VNE's engine build (VNE_LIBBOX_MARKER in
++// cmd/internal/build_libbox); empty in any other build. The release gate reads it
++// back from the linked app binary. Exported so the binding keeps it reachable.
++var vneEngineMarker string
++
++func VNEEngineMarker() string {
++	return vneEngineMarker
++}
