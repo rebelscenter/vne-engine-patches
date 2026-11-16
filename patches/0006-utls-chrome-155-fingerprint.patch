@@ -1,0 +1,302 @@
+diff --git a/common/tls/reality_client.go b/common/tls/reality_client.go
+index 1523122..81f1bd8 100644
+--- a/common/tls/reality_client.go
++++ b/common/tls/reality_client.go
+@@ -139,9 +139,12 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
+ 	uConfig.InsecureSkipVerify = true
+ 	uConfig.SessionTicketsDisabled = true
+ 	uConfig.VerifyPeerCertificate = verifier.VerifyPeerCertificate
+-	uConn := utls.UClient(conn, uConfig, e.uClient.id)
++	uConn, err := newUTLSConn(conn, uConfig, e.uClient.id)
++	if err != nil {
++		return nil, err
++	}
+ 	verifier.UConn = uConn
+-	err := uConn.BuildHandshakeState()
++	err = uConn.BuildHandshakeState()
+ 	if err != nil {
+ 		return nil, err
+ 	}
+diff --git a/common/tls/utls_chrome.go b/common/tls/utls_chrome.go
+new file mode 100644
+index 0000000..0785989
+--- /dev/null
++++ b/common/tls/utls_chrome.go
+@@ -0,0 +1,147 @@
++//go:build with_utls
++
++package tls
++
++import (
++	"crypto/rand"
++	"net"
++
++	utls "github.com/metacubex/utls"
++)
++
++// VNE: the "chrome" fingerprint sends the Chrome 155 ClientHello of Xray-core
++// 26.11.9 (refraction-networking/utls a13c59ff); the pinned uTLS stops at Chrome 133.
++func newUTLSConn(conn net.Conn, config *utls.Config, id utls.ClientHelloID) (*utls.UConn, error) {
++	if id != utls.HelloChrome_Auto {
++		return utls.UClient(conn, config, id), nil
++	}
++	// As for every built-in parrot: a spec without pre_shared_key skips resumption.
++	config.PreferSkipResumptionOnNilExtension = true
++	uConn := utls.UClient(conn, config, utls.HelloCustom)
++	spec := chrome155Spec()
++	err := uConn.ApplyPreset(&spec)
++	if err != nil {
++		return nil, err
++	}
++	return uConn, nil
++}
++
++// chrome155Spec is HelloChrome_133 plus ML-DSA signature schemes and trust anchor IDs.
++func chrome155Spec() utls.ClientHelloSpec {
++	// This uTLS leaves a GREASE placeholder in signature_algorithms as is; Chrome
++	// sends a random 0x?a?a there, so draw it here.
++	var seed [1]byte
++	_, _ = rand.Read(seed[:])
++	greaseScheme := utls.SignatureScheme(seed[0]&0xf0|0x0a) * 0x0101
++	return utls.ClientHelloSpec{
++		CipherSuites: []uint16{
++			utls.GREASE_PLACEHOLDER,
++			utls.TLS_AES_128_GCM_SHA256,
++			utls.TLS_AES_256_GCM_SHA384,
++			utls.TLS_CHACHA20_POLY1305_SHA256,
++			utls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
++			utls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
++			utls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
++			utls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
++			utls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
++			utls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
++			utls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
++			utls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
++			utls.TLS_RSA_WITH_AES_128_GCM_SHA256,
++			utls.TLS_RSA_WITH_AES_256_GCM_SHA384,
++			utls.TLS_RSA_WITH_AES_128_CBC_SHA,
++			utls.TLS_RSA_WITH_AES_256_CBC_SHA,
++		},
++		CompressionMethods: []byte{0x00},
++		Extensions: utls.ShuffleChromeTLSExtensions([]utls.TLSExtension{
++			&utls.UtlsGREASEExtension{},
++			&utls.SNIExtension{},
++			&utls.ExtendedMasterSecretExtension{},
++			&utls.RenegotiationInfoExtension{Renegotiation: utls.RenegotiateOnceAsClient},
++			&utls.SupportedCurvesExtension{Curves: []utls.CurveID{
++				utls.GREASE_PLACEHOLDER,
++				utls.X25519MLKEM768,
++				utls.X25519,
++				utls.CurveP256,
++				utls.CurveP384,
++			}},
++			&utls.SupportedPointsExtension{SupportedPoints: []byte{0x00}},
++			&utls.SessionTicketExtension{},
++			&utls.ALPNExtension{AlpnProtocols: []string{"h2", "http/1.1"}},
++			&utls.StatusRequestExtension{},
++			&utls.SignatureAlgorithmsExtension{SupportedSignatureAlgorithms: []utls.SignatureScheme{
++				greaseScheme,
++				0x0904, // mldsa44
++				0x0905, // mldsa65
++				0x0906, // mldsa87
++				utls.ECDSAWithP256AndSHA256,
++				utls.PSSWithSHA256,
++				utls.PKCS1WithSHA256,
++				utls.ECDSAWithP384AndSHA384,
++				utls.PSSWithSHA384,
++				utls.PKCS1WithSHA384,
++				utls.PSSWithSHA512,
++				utls.PKCS1WithSHA512,
++			}},
++			&utls.SCTExtension{},
++			&utls.KeyShareExtension{KeyShares: []utls.KeyShare{
++				{Group: utls.CurveID(utls.GREASE_PLACEHOLDER), Data: []byte{0}},
++				{Group: utls.X25519MLKEM768},
++				{Group: utls.X25519},
++			}},
++			&utls.PSKKeyExchangeModesExtension{Modes: []uint8{utls.PskModeDHE}},
++			&utls.SupportedVersionsExtension{Versions: []uint16{
++				utls.GREASE_PLACEHOLDER,
++				utls.VersionTLS13,
++				utls.VersionTLS12,
++			}},
++			&utls.UtlsCompressCertExtension{Algorithms: []utls.CertCompressionAlgo{utls.CertCompressionBrotli}},
++			&utls.ApplicationSettingsExtensionNew{SupportedProtocols: []string{"h2"}},
++			&utls.GenericExtension{Id: 0xca34, Data: chrome155TrustAnchors()},
++			utls.BoringGREASEECH(),
++			&utls.UtlsGREASEExtension{},
++		}),
++	}
++}
++
++// chrome155TrustAnchors is the trust_anchors (draft-ietf-tls-trust-anchor-ids) body:
++// the Chrome Root Store IDs a fresh Chrome 155 advertises, in its order.
++func chrome155TrustAnchors() []byte {
++	ids := []string{
++		"\x82\xdf\x13\x02\x01",
++		"\x82\xdf\x13\x02\x06",
++		"\x82\xdf\x13\x02\x0d",
++		"\x82\xdf\x13\x02\x0e",
++		"\x82\xdf\x13\x02\x0f",
++		"\x82\xdf\x13\x02\x12",
++		"\x82\xdf\x13\x02\x13",
++		"\x82\xdf\x13\x02\x14",
++		"\x83\x9a\x64\x8c\x9b\x2d\x01\x07",
++		"\x83\x9a\x64\x8c\x9b\x2d\x01\x08",
++		"\x83\x9a\x64\x8c\x9b\x2d\x01\x09",
++		"\x83\x9a\x64\x8c\x9b\x2d\x01\x0a",
++		"\x83\x9a\x64\x8c\x9b\x2d\x01\x0b",
++		"\x83\x9a\x64\x8c\x9b\x2d\x01\x0c",
++		"\x83\x9a\x64\x8c\x9b\x2d\x01\x0d",
++		"\x83\x9a\x64\x8c\x9b\x2d\x01\x12",
++		"\x83\x9a\x64\x8c\x9b\x2d\x01\x13",
++		"\xd6\x79\x09\x01",
++		"\xd6\x79\x09\x04",
++		"\xd6\x79\x09\x05",
++		"\xd6\x79\x09\x06",
++		"\xd6\x79\x09\x07",
++		"\xd6\x79\x09\x08",
++		"\xd6\x79\x09\x0a",
++		"\xd6\x79\x09\x0b",
++		"\xd6\x79\x09\x0c",
++		"\xd6\x79\x09\x0d",
++		"\xd6\x79\x09\x0f",
++	}
++	list := []byte{0, 0}
++	for _, id := range ids {
++		list = append(list, byte(len(id)))
++		list = append(list, id...)
++	}
++	list[0], list[1] = byte((len(list)-2)>>8), byte(len(list)-2)
++	return list
++}
+diff --git a/common/tls/utls_chrome_test.go b/common/tls/utls_chrome_test.go
+new file mode 100644
+index 0000000..8082060
+--- /dev/null
++++ b/common/tls/utls_chrome_test.go
+@@ -0,0 +1,107 @@
++//go:build with_utls
++
++package tls
++
++import (
++	"context"
++	"crypto/tls"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"testing"
++
++	utls "github.com/metacubex/utls"
++	"github.com/stretchr/testify/require"
++)
++
++func builtExtensions(t *testing.T, fingerprint string) []utls.TLSExtension {
++	t.Helper()
++	id, err := uTLSClientHelloID(fingerprint)
++	require.NoError(t, err)
++	client, server := net.Pipe()
++	t.Cleanup(func() { client.Close(); server.Close() })
++	uConn, err := newUTLSConn(client, &utls.Config{ServerName: "example.com"}, id)
++	require.NoError(t, err)
++	require.NoError(t, uConn.BuildHandshakeState())
++	return uConn.Extensions
++}
++
++func TestUTLSChromeFingerprintIsChrome155(t *testing.T) {
++	t.Parallel()
++	var mldsa, trustAnchors bool
++	var shares []utls.CurveID
++	for _, extension := range builtExtensions(t, "chrome") {
++		switch e := extension.(type) {
++		case *utls.SignatureAlgorithmsExtension:
++			mldsa = len(e.SupportedSignatureAlgorithms) == 12 && e.SupportedSignatureAlgorithms[1] == 0x0904
++			grease := uint16(e.SupportedSignatureAlgorithms[0])
++			require.True(t, grease&0x0f0f == 0x0a0a && grease>>8 == grease&0xff, "%04x is not GREASE", grease)
++		case *utls.GenericExtension:
++			trustAnchors = e.Id == 0xca34 && len(e.Data) == 186 && e.Data[0] == 0 && e.Data[1] == 184
++		case *utls.KeyShareExtension:
++			for _, share := range e.KeyShares[1:] {
++				shares = append(shares, share.Group)
++			}
++			require.Len(t, e.KeyShares[1].Data, 1216, "X25519MLKEM768 share must be generated")
++		}
++	}
++	require.True(t, mldsa, "chrome must offer the ML-DSA signature schemes of Chrome 155")
++	require.True(t, trustAnchors, "chrome must send the trust_anchors extension of Chrome 155")
++	require.Equal(t, []utls.CurveID{utls.X25519MLKEM768, utls.X25519}, shares)
++}
++
++func TestUTLSOtherFingerprintsKeepTheirParrot(t *testing.T) {
++	t.Parallel()
++	for _, fingerprint := range []string{"firefox", "edge", "safari", "ios", "qq"} {
++		for _, extension := range builtExtensions(t, fingerprint) {
++			_, generic := extension.(*utls.GenericExtension)
++			require.False(t, generic, fingerprint)
++		}
++	}
++}
++
++// The custom spec must complete a real handshake, twice with a session cache:
++// uTLS panics on resumption for a custom spec unless told to skip it.
++func TestUTLSChromeHandshake(t *testing.T) {
++	t.Parallel()
++	server := httptest.NewUnstartedServer(http.NotFoundHandler())
++	server.TLS = &tls.Config{NextProtos: []string{"h2", "http/1.1"}}
++	server.StartTLS()
++	defer server.Close()
++	config := &UTLSClientConfig{
++		ctx: context.Background(),
++		config: &utls.Config{
++			ServerName:         "example.com",
++			InsecureSkipVerify: true,
++			ClientSessionCache: utls.NewLRUClientSessionCache(1),
++		},
++		id: utls.HelloChrome_Auto,
++	}
++	for range 2 {
++		conn, err := net.Dial("tcp", server.Listener.Addr().String())
++		require.NoError(t, err)
++		tlsConn, err := config.Client(conn)
++		require.NoError(t, err)
++		require.NoError(t, tlsConn.HandshakeContext(context.Background()))
++		require.Equal(t, "h2", tlsConn.ConnectionState().NegotiatedProtocol)
++		require.Equal(t, uint16(tls.VersionTLS13), tlsConn.ConnectionState().Version)
++		// The session tickets arrive ahead of the server's h2 SETTINGS frame.
++		_, err = tlsConn.Read(make([]byte, 1))
++		require.NoError(t, err)
++		conn.Close()
++	}
++}
++
++// Chrome draws the signature_algorithms GREASE value per connection; a constant would mark us.
++func TestUTLSChromeSignatureGREASEVaries(t *testing.T) {
++	t.Parallel()
++	seen := map[utls.SignatureScheme]bool{}
++	for range 64 {
++		for _, extension := range chrome155Spec().Extensions {
++			if e, ok := extension.(*utls.SignatureAlgorithmsExtension); ok {
++				seen[e.SupportedSignatureAlgorithms[0]] = true
++			}
++		}
++	}
++	require.Greater(t, len(seen), 1)
++}
+diff --git a/common/tls/utls_client.go b/common/tls/utls_client.go
+index 16d0352..c0c590b 100644
+--- a/common/tls/utls_client.go
++++ b/common/tls/utls_client.go
+@@ -90,7 +90,11 @@ func (c *UTLSClientConfig) Client(conn net.Conn) (Conn, error) {
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	return &utlsALPNWrapper{utlsConnWrapper{utls.UClient(conn, c.config.Clone(), c.id)}, c.config.NextProtos}, nil
++	uConn, err := newUTLSConn(conn, c.config.Clone(), c.id)
++	if err != nil {
++		return nil, err
++	}
++	return &utlsALPNWrapper{utlsConnWrapper{uConn}, c.config.NextProtos}, nil
+ }
+ 
+ func (c *UTLSClientConfig) SetSessionIDGenerator(generator func(clientHello []byte, sessionID []byte) error) {
