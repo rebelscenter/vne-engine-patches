@@ -55,4 +55,6 @@ for patch in "$PATCHES"/*.patch; do
 done
 # Patch 0004 adds the XHTTP transport; its tests gate every build (host GOOS/GOARCH).
 (cd "$SRC" && env -u GOOS -u GOARCH CGO_ENABLED=0 go test -count=1 ./transport/v2rayxhttp/)
+# 0006 makes the "chrome" fingerprint Chrome 155; its tests gate every build too.
+(cd "$SRC" && env -u GOOS -u GOARCH CGO_ENABLED=0 go test -count=1 -tags with_utls -run '^TestUTLS' ./common/tls/)
 echo "singbox-src: $TAG + $(ls "$PATCHES"/*.patch | wc -l | tr -d ' ') patch(es) in $SRC"

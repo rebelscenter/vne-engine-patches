@@ -19,6 +19,7 @@ endorsed by it. For the engine itself, use the upstream repository.
 | `0003-libbox-oomprofile-go127-record.patch` | libbox OOM profiler: memory-profile record layout for Go 1.27 (keeps the old layout for earlier Go). |
 | `0004-xhttp-client-transport.patch` | New `xhttp` V2Ray transport: client for Xray-core's XHTTP ("splithttp") in stream-one and stream-up modes over HTTP/2, with tests. |
 | `0005-deps-security-bumps.patch` | Dependency updates: Go 1.26, `golang.org/x/*`, gRPC and several indirect modules. |
+| `0006-utls-chrome-155-fingerprint.patch` | The `chrome` uTLS fingerprint sends the Chrome 155 ClientHello (ML-DSA signature schemes, trust anchor IDs), the same one Xray-core 26.11.9 sends; the bundled uTLS stops at Chrome 133. Other fingerprints are unchanged. |
 
 `patches/SHA256SUMS` lists the digest of every patch; the scripts refuse a
 patch whose digest does not match.
