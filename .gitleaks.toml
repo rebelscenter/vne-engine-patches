@@ -1,0 +1,12 @@
+# Default gitleaks rules plus allowlists tuned on a full-history run (OPS-28).
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Public hashes and RFC test vectors, never credentials"
+regexTarget = "match"
+regexes = [
+  '''h1:[A-Za-z0-9+/]{10,}''',
+  '''sha256:[0-9a-f]{64}''',
+  '''JBSWY3DP''',
+]
